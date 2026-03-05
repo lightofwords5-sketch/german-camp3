@@ -1,80 +1,63 @@
-import bcrypt
-import datetime
-from typing import Optional
+# auth.py
 
-from data_manager import load_sheet, write_row
+from flask import Flask, redirect, url_for, request, session, flash
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 
-# Authentication helpers moved out of app.py for modularity
+app = Flask(__name__)
+app.secret_key = 'your_secret_key'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-def hash_pw(password: str) -> str:
-    """Return bcrypt hash of password."""
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+db = SQLAlchemy(app)
 
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(120), nullable=False)
+    role = db.Column(db.String(10), nullable=False)  # Either 'admin' or 'student'
 
-def check_pw(password: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(password.encode(), hashed.encode())
-    except Exception:
-        return False
+    def __repr__(self):
+        return f'<User {self.username}>'
 
+# Role-based access control decorator
+def role_required(role):
+    def wrapper(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'username' not in session or session['role'] != role:
+                flash('You do not have permission to access this page.')
+                return redirect(url_for('login'))
+            return f(*args, **kwargs)
+        return decorated_function
+    return wrapper
 
-def get_user(email: str) -> Optional[dict]:
-    df = load_sheet("Users")
-    if df.empty or "Email" not in df.columns:
-        return None
-    row = df[df["Email"].str.lower() == email.lower()]
-    return row.iloc[0].to_dict() if not row.empty else None
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        user = User.query.filter_by(username=username).first()
+        if user and check_password_hash(user.password, password):
+            session['username'] = user.username
+            session['role'] = user.role
+            flash('Login successful!')
+            return redirect(url_for('dashboard'))
+        flash('Invalid credentials. Please try again.')
+    return render_template('login.html')
 
+@app.route('/logout')
+def logout():
+    session.pop('username', None)
+    session.pop('role', None)
+    flash('You have been logged out.')
+    return redirect(url_for('login'))
 
-def register_user(name: str, email: str, password: str) -> bool:
-    if get_user(email):
-        return False
-    hashed = hash_pw(password)
-    now = datetime.datetime.now().isoformat()
-    return write_row("Users", [name, email, hashed, 0, 0, 1, 0, now, ""])
+@app.route('/dashboard')
+@role_required('admin')  # Admin only view
+def dashboard():
+    return 'Welcome to the admin dashboard!'
 
-
-def login_user(email: str, password: str):
-    user = get_user(email)
-    if user and check_pw(password, str(user.get("Password", ""))):
-        return user
-    return None
-
-
-def update_user_xp(email: str, new_xp: int, new_streak: int, completed_days_json: str):
-    """Bulk update XP, streak, and completed days for a user."""
-    from data_manager import get_gsheet_client
-
-    client = get_gsheet_client()
-    if not client:
-        return
-    try:
-        sheet_id = None
-        try:
-            import streamlit as st
-            sheet_id = st.secrets.get("sheet_id")
-        except Exception:
-            pass
-        if not sheet_id:
-            return
-        wk = client.open_by_key(sheet_id).worksheet("Users")
-        records = wk.get_all_records()
-        headers = wk.row_values(1)
-        for i, row in enumerate(records, start=2):
-            if str(row.get("Email", "")).lower() == email.lower():
-                xp_col = headers.index("XP") + 1
-                streak_col = headers.index("Streak") + 1
-                days_col = headers.index("CompletedDays") + 1
-                wk.update_cell(i, xp_col, new_xp)
-                wk.update_cell(i, streak_col, new_streak)
-                wk.update_cell(i, days_col, completed_days_json)
-                break
-        # clear cache in loader
-        from data_manager import load_sheet
-        load_sheet.clear()
-    except Exception as e:
-        try:
-            import streamlit as st
-            st.error(f"XP update error: {e}")
-        except Exception:
-            pass
+if __name__ == '__main__':
+    app.run(debug=True)
